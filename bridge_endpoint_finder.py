@@ -1,10 +1,31 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 from io import BytesIO
 from openpyxl.styles import PatternFill
 
-OVERPASS = "https://lz4.overpass-api.de/api/interpreter"
+# 複数の Overpass API サーバー候補
+OVERPASS_SERVERS = [
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter"
+]
+
+def safe_request(query, retries=3, wait=3):
+    """Overpass APIに安全にクエリを投げる（リトライ付き）"""
+    for attempt in range(retries):
+        for server in OVERPASS_SERVERS:
+            try:
+                r = requests.get(server, params={"data": query}, timeout=90)
+                if r.status_code == 200:
+                    js = r.json()
+                    if js.get("elements"):
+                        return js
+            except Exception:
+                pass
+        time.sleep(wait)  # 次のリトライまで待つ
+    return None
 
 def decimal_to_dms(lat, lon):
     def conv(v, lat=True):
@@ -23,14 +44,11 @@ def get_way_and_endpoints(name, area_id):
     >;
     out skel qt;
     """
-    r = requests.get(OVERPASS, params={"data": query})
-    if r.status_code != 200:
-        return None, None, None
-    js = r.json()
+    js = safe_request(query)
+    if not js: return None, None, None
     nodes = {e["id"]:(e.get("lat"), e.get("lon")) for e in js.get("elements",[]) if e["type"]=="node"}
     ways = [e for e in js.get("elements",[]) if e["type"]=="way"]
-    if not ways:
-        return None, None, None
+    if not ways: return None, None, None
     w = ways[0]
     nids = w.get("nodes", [])
     if not nids: return None, None, None
@@ -45,10 +63,8 @@ def get_nameless_bridges(area_id):
     >;
     out skel qt;
     """
-    r = requests.get(OVERPASS, params={"data": query})
-    if r.status_code != 200:
-        return []
-    js = r.json()
+    js = safe_request(query)
+    if not js: return []
     nodes = {e["id"]:(e.get("lat"), e.get("lon")) for e in js.get("elements",[]) if e["type"]=="node"}
     ways = [e for e in js.get("elements",[]) if e["type"]=="way"]
     results = []
@@ -92,26 +108,16 @@ if uploaded:
         # 「橋名なし」と明示された場合 → 候補検索
         if name == "橋名なし" and pd.notna(area_id):
             candidates = get_nameless_bridges(int(area_id))
-            for c in candidates:
-                candidate_rows.append({
-                    "橋名": c["橋名"],
-                    "県名": row["県名"],
-                    "市町村": row["市町村"],
-                    "AreaID": c["AreaID"],
-                    "way_id": c["way_id"],
-                    "起点_緯度(十進)": c["起点_緯度(十進)"],
-                    "起点_経度(十進)": c["起点_経度(十進)"],
-                    "終点_緯度(十進)": c["終点_緯度(十進)"],
-                    "終点_経度(十進)": c["終点_経度(十進)"],
-                    "起点_緯度(度分秒)": c["起点_緯度(度分秒)"],
-                    "起点_経度(度分秒)": c["起点_経度(度分秒)"],
-                    "終点_緯度(度分秒)": c["終点_緯度(度分秒)"],
-                    "終点_経度(度分秒)": c["終点_経度(度分秒)"],
-                })
+            candidate_rows.extend([{
+                "橋名": c["橋名"],
+                "県名": row["県名"],
+                "市町村": row["市町村"],
+                **c
+            } for c in candidates])
             progress.progress((i+1)/len(df))
             continue
 
-        # 橋名が空の場合は未ヒット
+        # 橋名が空 → 未ヒット
         if not name:
             failed_rows.append({"橋名": name, "県名": row["県名"], "市町村": row["市町村"], "AreaID": area_id})
             progress.progress((i+1)/len(df))
@@ -122,14 +128,13 @@ if uploaded:
             progress.progress((i+1)/len(df))
             continue
 
-        # 通常の橋検索
+        # 通常検索
         way_id, s, e = get_way_and_endpoints(name, int(area_id))
         if way_id and s and e and all(s) and all(e):
             slat, slon = s
             elat, elon = e
             sdms_lat, sdms_lon = decimal_to_dms(slat, slon)
             edms_lat, edms_lon = decimal_to_dms(elat, elon)
-
             success_rows.append({
                 "橋名": name,
                 "県名": row["県名"],
@@ -146,6 +151,7 @@ if uploaded:
 
         progress.progress((i+1)/len(df))
 
+    # データフレーム化
     df_success = pd.DataFrame(success_rows)
     df_failed  = pd.DataFrame(failed_rows)
     df_candidates = pd.DataFrame(candidate_rows)
@@ -173,42 +179,17 @@ if uploaded:
             df_candidates.to_excel(writer, sheet_name="橋名なし候補", index=False)
 
         wb = writer.book
-
-        # 成功した橋シートの加工
-        if "成功した橋" in wb.sheetnames:
-            ws = wb["成功した橋"]
-            blue   = PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid")
-            orange = PatternFill(start_color="FFE5CC", end_color="FFE5CC", fill_type="solid")
-
-            headers = [c.value for c in ws[1]]
-            for col_idx, h in enumerate(headers, start=1):
-                if not h: continue
-                if str(h).startswith("起点"):
+        for sheet_name in ["成功した橋", "橋名なし候補"]:
+            if sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                headers = [c.value for c in ws[1]]
+                if "way_id" in headers:
+                    col_idx = headers.index("way_id") + 1
                     for r in range(2, ws.max_row+1):
-                        ws.cell(row=r, column=col_idx).fill = blue
-                elif str(h).startswith("終点"):
-                    for r in range(2, ws.max_row+1):
-                        ws.cell(row=r, column=col_idx).fill = orange
-
-            if "way_id" in headers:
-                col_idx = headers.index("way_id") + 1
-                for r in range(2, ws.max_row+1):
-                    url = ws.cell(row=r, column=col_idx).value
-                    if url:
-                        ws.cell(row=r, column=col_idx).hyperlink = url
-                        ws.cell(row=r, column=col_idx).style = "Hyperlink"
-
-        # 橋名なし候補シートの加工
-        if "橋名なし候補" in wb.sheetnames:
-            ws = wb["橋名なし候補"]
-            headers = [c.value for c in ws[1]]
-            if "way_id" in headers:
-                col_idx = headers.index("way_id") + 1
-                for r in range(2, ws.max_row+1):
-                    url = ws.cell(row=r, column=col_idx).value
-                    if url:
-                        ws.cell(row=r, column=col_idx).hyperlink = url
-                        ws.cell(row=r, column=col_idx).style = "Hyperlink"
+                        url = ws.cell(row=r, column=col_idx).value
+                        if url:
+                            ws.cell(row=r, column=col_idx).hyperlink = url
+                            ws.cell(row=r, column=col_idx).style = "Hyperlink"
 
     st.download_button(
         label="📥 結果をダウンロード（Excel：bridge_endpoints.xlsx）",
